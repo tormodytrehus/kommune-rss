@@ -19,6 +19,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -32,7 +33,12 @@ jobs:
         with:
           node-version: 20
 
+      - name: Installer PDF-leser
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
       - name: Lag RSS-filene
+        env:
+          MAX_PDF_SCANS: 20
         run: npm run generate
 
       - name: Sett opp GitHub Pages
