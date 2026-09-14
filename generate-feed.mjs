@@ -10,6 +10,34 @@ const OPEN_GOV = [
   { slug: "orkland", name: "Orkland" },
 ];
 
+const CONTROL_COMMITTEES = [
+  {
+    slug: "orkland-kontrollutvalg",
+    name: "Orkland kontrollutvalg",
+    source: "https://www.konsek.no/kontrollutvalg/orkland/",
+    type: "konsek",
+  },
+  {
+    slug: "skaun-kontrollutvalg",
+    name: "Skaun kontrollutvalg",
+    source: "https://www.konsek.no/kontrollutvalg/skaun/",
+    type: "konsek",
+  },
+  {
+    slug: "heim-kontrollutvalg",
+    name: "Heim kontrollutvalg",
+    source: "https://www.konsek.no/kontrollutvalg/heim/",
+    type: "konsek",
+  },
+  {
+    slug: "rindal-kontrollutvalg",
+    name: "Rindal kontrollutvalg",
+    source: "https://opengov.360online.com/Meetings/rindal/Boards/Details/208126",
+    siteSlug: "rindal",
+    type: "opengov",
+  },
+];
+
 const repository = process.env.GITHUB_REPOSITORY || "";
 const [repositoryOwner, repositoryName] = repository.split("/");
 const publishedStateUrl =
@@ -218,17 +246,69 @@ function extractOpenGovMeeting(html, meetingUrl, slug, municipality) {
   };
 }
 
-async function buildOpenGovMeetings({ slug, name }) {
-  const source = `https://opengov.360online.com/Meetings/${slug}`;
+async function buildOpenGovMeetings({ slug, name, source: configuredSource, siteSlug }) {
+  const source = configuredSource || `https://opengov.360online.com/Meetings/${slug}`;
   const indexHtml = await fetchText(source);
-  const meetingLinks = extractMeetingLinks(indexHtml, source, slug);
+  const meetingLinks = extractMeetingLinks(indexHtml, source, siteSlug || slug);
   const meetings = await mapLimit(meetingLinks, 4, async (url) =>
     extractOpenGovMeeting(await fetchText(url), url, slug, name)
   );
   return {
+    sourceKey: slug,
     name,
     source,
     meetings,
+  };
+}
+
+function parseNorwegianDate(value) {
+  const match = value.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (!match) return null;
+  return new Date(`${match[3]}-${match[2]}-${match[1]}T12:00:00Z`);
+}
+
+function extractKonsekMeetings(html, { slug, name, source }) {
+  const now = new Date();
+  const lower = now.valueOf() - 90 * 24 * 60 * 60 * 1000;
+  const upper = now.valueOf() + 400 * 24 * 60 * 60 * 1000;
+  const sections = [];
+  const sectionPattern = /<section\s+class=["'][^"']*\bmote\b[^"']*["']\s+id=["']m-(\d+)["'][^>]*>([\s\S]*?)<\/section>/gi;
+
+  for (const match of html.matchAll(sectionPattern)) {
+    const id = match[1];
+    const section = match[2];
+    const dateText = section.match(/fa-calendar[^>]*><\/i>\s*(\d{2}\.\d{2}\.\d{4})/i)?.[1];
+    const date = dateText ? parseNorwegianDate(dateText) : null;
+    if (!date || date.valueOf() < lower || date.valueOf() > upper) continue;
+
+    const papers = [];
+    const pdfPattern = /href=["']([^"']+\.pdf(?:\?[^"']*)?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    for (const pdf of section.matchAll(pdfPattern)) {
+      const link = new URL(decodeHtml(pdf[1]), source).href;
+      const title = normalize(decodeHtml(pdf[2].replace(/<[^>]+>/g, " ")));
+      papers.push({ key: link, title: title || "Dokument" });
+    }
+
+    sections.push({
+      key: `${slug}:${id}`,
+      municipality: name,
+      title: `Kontrollutvalget ${name.replace(" kontrollutvalg", "")} ${dateText}`,
+      link: `${source}#m-${id}`,
+      papers: uniqueBy(papers, "key"),
+    });
+  }
+  return sections;
+}
+
+async function buildKonsekMeetings(configuration) {
+  return {
+    sourceKey: configuration.slug,
+    name: configuration.name,
+    source: configuration.source,
+    meetings: extractKonsekMeetings(
+      await fetchText(configuration.source),
+      configuration
+    ),
   };
 }
 
@@ -284,6 +364,7 @@ async function buildSkaunMeetings() {
   });
 
   return {
+    sourceKey: "skaun",
     name: "Skaun",
     source: `${SKAUN_BASE}/${SKAUN_TENANT}/Dmb`,
     meetings: results,
@@ -300,10 +381,17 @@ function buildMeetingEvents(sources, previousState) {
   const previousMeetings = previousState?.meetings || {};
   const currentMeetings = sources.flatMap((source) => source.meetings);
   const nextMeetings = { ...previousMeetings };
+  const inferredSources = new Set(
+    Object.keys(previousMeetings).map((key) => key.split(":")[0])
+  );
+  const monitoredSources = new Set(
+    previousState?.monitoredSources || inferredSources
+  );
   const newEvents = [];
 
   for (const meeting of currentMeetings) {
     const previous = previousMeetings[meeting.key];
+    const sourceKey = meeting.key.split(":")[0];
     const currentPaperKeys = meeting.papers.map((paper) => paper.key);
     nextMeetings[meeting.key] = {
       municipality: meeting.municipality,
@@ -313,7 +401,7 @@ function buildMeetingEvents(sources, previousState) {
     };
 
     // Første kjøring oppretter bare et utgangspunkt og sender ingen gamle varsler.
-    if (!previousState) continue;
+    if (!previousState || !monitoredSources.has(sourceKey)) continue;
 
     if (!previous) {
       newEvents.push({
@@ -350,7 +438,17 @@ function buildMeetingEvents(sources, previousState) {
     "guid"
   ).slice(0, 100);
   return {
-    state: { version: 1, meetings: nextMeetings, events },
+    state: {
+      version: 2,
+      monitoredSources: [
+        ...new Set([
+          ...monitoredSources,
+          ...sources.map((source) => source.sourceKey),
+        ]),
+      ],
+      meetings: nextMeetings,
+      events,
+    },
     events,
     newEventCount: newEvents.length,
   };
@@ -358,15 +456,22 @@ function buildMeetingEvents(sources, previousState) {
 
 await mkdir("public", { recursive: true });
 
-const [previousState, skaunPostlist, skaunMeetings, ...openGovMeetings] = await Promise.all([
+const controlSources = CONTROL_COMMITTEES.map((committee) =>
+  committee.type === "konsek"
+    ? buildKonsekMeetings(committee)
+    : buildOpenGovMeetings(committee)
+);
+
+const [previousState, skaunPostlist, skaunMeetings, openGovMeetings, controlMeetings] = await Promise.all([
   loadPreviousState(),
   buildSkaunPostlist(),
   buildSkaunMeetings(),
-  ...OPEN_GOV.map(buildOpenGovMeetings),
+  Promise.all(OPEN_GOV.map(buildOpenGovMeetings)),
+  Promise.all(controlSources),
 ]);
 
 await writeFeed("skaun-postliste.xml", skaunPostlist);
-const meetingSources = [skaunMeetings, ...openGovMeetings];
+const meetingSources = [skaunMeetings, ...openGovMeetings, ...controlMeetings];
 const { state, events, newEventCount } = buildMeetingEvents(
   meetingSources,
   previousState
@@ -396,6 +501,26 @@ for (const municipality of municipalityFeeds) {
   });
 }
 
+for (let index = 0; index < CONTROL_COMMITTEES.length; index += 1) {
+  const committee = CONTROL_COMMITTEES[index];
+  await writeFeed(`${committee.slug}.xml`, {
+    title: `Møter og nye sakspapirer ${committee.name}`,
+    link: committee.source,
+    description: `Nye møter og sakspapirer fra ${committee.name}`,
+    items: events.filter((event) => event.municipality === committee.name),
+  });
+}
+
+const controlNames = new Set(CONTROL_COMMITTEES.map((committee) => committee.name));
+await writeFeed("alle-kontrollutvalg.xml", {
+  title: "Nye møter og sakspapirer – alle kontrollutvalg",
+  link: CONTROL_COMMITTEES[0].source,
+  description: "Nye kontrollutvalgsmøter og sakspapirer fra fire kommuner",
+  items: events
+    .filter((event) => controlNames.has(event.municipality))
+    .map((event) => ({ ...event, title: `[${event.municipality}] ${event.title}` })),
+});
+
 await writeFeed("alle-sakspapirer.xml", {
   title: "Nye møter og sakspapirer – alle kommuner",
   link: skaunMeetings.source,
@@ -417,6 +542,11 @@ await writeFile(
   <li><a href="rindal-sakspapirer.xml">Sakspapirer Rindal</a></li>
   <li><a href="heim-sakspapirer.xml">Sakspapirer Heim</a></li>
   <li><a href="orkland-sakspapirer.xml">Sakspapirer Orkland</a></li>
+  <li><a href="skaun-kontrollutvalg.xml">Kontrollutvalget Skaun</a></li>
+  <li><a href="rindal-kontrollutvalg.xml">Kontrollutvalget Rindal</a></li>
+  <li><a href="heim-kontrollutvalg.xml">Kontrollutvalget Heim</a></li>
+  <li><a href="orkland-kontrollutvalg.xml">Kontrollutvalget Orkland</a></li>
+  <li><a href="alle-kontrollutvalg.xml">Alle kontrollutvalg samlet</a></li>
   <li><a href="alle-sakspapirer.xml">Alle sakspapirer samlet</a></li>
   </ul></html>`,
   "utf8"
