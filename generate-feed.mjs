@@ -29,37 +29,48 @@ try {
     userAgent:
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
   });
+  page.setDefaultTimeout(10_000);
 
   await page.goto(SOURCE_URL, {
     waitUntil: "domcontentloaded",
     timeout: 90_000,
   });
 
-  const cards = page.locator(".insn-list .card");
-  await cards.first().waitFor({ state: "visible", timeout: 90_000 });
+  await page.waitForFunction(
+    () => document.querySelectorAll(".insn-list .card").length > 0,
+    { timeout: 90_000 }
+  );
 
-  const posts = [];
-  const count = Math.min(await cards.count(), 50);
+  // Les alle kort i én nettleseroperasjon. Dette unngår at en manglende
+  // selektor kan gi 30 sekunders venting for hvert enkelt kort.
+  const rawPosts = await page.locator(".insn-list .card").evaluateAll(
+    (cards, sourceUrl) =>
+      cards.slice(0, 50).map((card, index) => {
+        const titleNode =
+          card.querySelector(".card-title span.expanded-view-title") ||
+          card.querySelector(".card-title span.font-weight-bold") ||
+          card.querySelector(".card-title button");
+        const linkNode = card.querySelector(
+          '.card-title a[href*="/RegistryEntry/"]'
+        );
+        const title = (titleNode?.textContent || "").replace(/\s+/g, " ").trim();
+        const rawHref = linkNode?.getAttribute("href");
+        const link = rawHref ? new URL(rawHref, sourceUrl).href : sourceUrl;
+        const fullText = (card.textContent || "").replace(/\s+/g, " ").trim();
+        return { title, link, fullText, index };
+      }),
+    SOURCE_URL
+  );
 
-  for (let index = 0; index < count; index += 1) {
-    const card = cards.nth(index);
-    const titleNode = card.locator(
-      ".card-title span.expanded-view-title, .card-title span.font-weight-bold"
-    ).last();
-    const linkNode = card.locator(
-      '.card-title a[href*="/RegistryEntry/"]'
-    ).first();
-
-    const title = normalize(await titleNode.textContent().catch(() => ""));
-    if (!title) continue;
-
-    const rawHref = await linkNode.getAttribute("href").catch(() => null);
-    const link = rawHref ? new URL(rawHref, SOURCE_URL).href : SOURCE_URL;
-    const fullText = normalize(await card.textContent().catch(() => ""));
-    const published = parseNorwegianDate(fullText);
-
-    posts.push({ title, link, description: fullText, published });
-  }
+  const posts = rawPosts
+    .filter((post) => post.title)
+    .map((post) => ({
+      title: post.title,
+      link: post.link,
+      description: post.fullText,
+      published: parseNorwegianDate(post.fullText),
+      guid: `${post.link}#rss-${post.index}`,
+    }));
 
   if (posts.length === 0) {
     throw new Error("Fant ingen poster på Skaun-postlisten.");
@@ -70,7 +81,7 @@ try {
       (post) => `    <item>
       <title>${escapeXml(post.title)}</title>
       <link>${escapeXml(post.link)}</link>
-      <guid isPermaLink="true">${escapeXml(post.link)}</guid>
+      <guid isPermaLink="false">${escapeXml(post.guid)}</guid>
       ${post.published ? `<pubDate>${post.published}</pubDate>` : ""}
       <description>${escapeXml(post.description)}</description>
     </item>`
