@@ -1,8 +1,19 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const SKAUN_TENANT = "939865942_PROD-939865942-SKAUN";
 const SKAUN_BASE = "https://prod01.elementscloud.no/publikum";
+const TRONDELAG_BASE = "https://opengov.360online.com/Meetings/TRONDELAG";
+const execFileAsync = promisify(execFile);
+
+const COUNTY_TERMS = {
+  Orkland: ["Orkland", "Orkland videregående skole", "Orkland vgs"],
+  Skaun: ["Skaun"],
+  Heim: ["Heim kommune", "Heim", "Kyrksæterøra videregående skole", "Kyrksæterøra vgs"],
+  Rindal: ["Rindal"],
+};
 
 const OPEN_GOV = [
   { slug: "rindal", name: "Rindal" },
@@ -108,6 +119,24 @@ function uniqueBy(items, key) {
   return [...new Map(items.map((item) => [item[key], item])).values()];
 }
 
+function stripHtml(value = "") {
+  return normalize(decodeHtml(value.replace(/<[^>]+>/g, " ")));
+}
+
+function exactWord(text, term) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const letters = "A-Za-zÆØÅæøå";
+  return new RegExp(`(^|[^${letters}])${escaped}([^${letters}]|$)`, "i").test(text);
+}
+
+function municipalityMatches(text = "") {
+  const matches = [];
+  for (const [municipality, terms] of Object.entries(COUNTY_TERMS)) {
+    if (terms.some((term) => exactWord(text, term))) matches.push(municipality);
+  }
+  return matches;
+}
+
 function revisionGuid(prefix, meetingKey, documentKeys) {
   const revision = createHash("sha256")
     .update([...documentKeys].sort().join("\n"))
@@ -178,6 +207,140 @@ async function loadPreviousState() {
   }
 }
 
+function monthParameters() {
+  const now = new Date();
+  return [-1, 0, 1, 2].map((offset) => {
+    const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 1));
+    return { month: date.getUTCMonth() + 1, year: date.getUTCFullYear() };
+  });
+}
+
+function extractCountyAgendaItems(html, meetingUrl) {
+  const meetingTitle = stripHtml(
+    html.match(/class=["'][^"']*meetingTitleHeaderText[^"']*["'][^>]*>([\s\S]*?)<\/h2>/i)?.[1] ||
+      "Politisk møte i Trøndelag fylkeskommune"
+  );
+  const items = [];
+  const pattern = /id=["']agendaItem_(\d+)["'][\s\S]*?<h5\s+class=["'][^"']*accordionTitleText[^"']*["'][^>]*>([\s\S]*?)<\/h5>/gi;
+  for (const match of html.matchAll(pattern)) {
+    const agendaItemId = match[1];
+    items.push({
+      key: `trondelag:${agendaItemId}`,
+      agendaItemId,
+      meetingTitle,
+      title: stripHtml(match[2]),
+      link: `${meetingUrl}?agendaItemId=${agendaItemId}`,
+    });
+  }
+  return items;
+}
+
+function extractCountyDocuments(html) {
+  const documents = [];
+  const pattern = /href=["']([^"']*\/File\/Details\/[^"']+\.pdf[^"']*)["'][\s\S]*?<div\s+class=["']fileNameDetail["']>([\s\S]*?)<\/div>/gi;
+  for (const match of html.matchAll(pattern)) {
+    const link = new URL(decodeHtml(match[1]), TRONDELAG_BASE);
+    documents.push({
+      key: link.pathname,
+      title: stripHtml(match[2]) || normalize(link.searchParams.get("fileName")) || "Dokument",
+      link: link.href,
+      size: Number(link.searchParams.get("fileSize")) || 0,
+    });
+  }
+  return uniqueBy(documents, "key");
+}
+
+async function extractPdfText(document, directory) {
+  if (document.size > 25_000_000) return "";
+  const response = await fetchChecked(document.link, {
+    headers: { Accept: "application/pdf" },
+  });
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > 25_000_000) return "";
+  const filename = `${document.key.split("/").at(-1).replace(/[^a-z0-9.-]/gi, "_")}`;
+  const path = `${directory}/${filename}`;
+  await writeFile(path, bytes);
+  const { stdout } = await execFileAsync("pdftotext", ["-layout", path, "-"], {
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+async function buildCountyCases(previousState) {
+  const previousCases = previousState?.countyCases || {};
+  const initialCountyRun = !previousState?.countyMonitored;
+  const monthPages = await mapLimit(monthParameters(), 2, ({ month, year }) =>
+    fetchText(`${TRONDELAG_BASE}/Meetings?month=${month}&year=${year}`)
+  );
+  const meetingLinks = uniqueBy(
+    monthPages.flatMap((html) =>
+      extractMeetingLinks(html, TRONDELAG_BASE, "TRONDELAG", 100).map((link) => ({ link }))
+    ),
+    "link"
+  ).map(({ link }) => link);
+  const agendaItems = uniqueBy(
+    (
+      await mapLimit(meetingLinks, 4, async (meetingUrl) =>
+        extractCountyAgendaItems(await fetchText(meetingUrl), meetingUrl)
+      )
+    ).flat(),
+    "key"
+  );
+
+  const cases = await mapLimit(agendaItems, 5, async (item) => {
+    const detailHtml = await fetchText(
+      `${TRONDELAG_BASE}/Meetings/LoadAgendaItemDetail/${item.agendaItemId}`
+    );
+    return { ...item, documents: extractCountyDocuments(detailHtml) };
+  });
+
+  const temporaryRoot = process.env.RUNNER_TEMP || "public";
+  const directory = await mkdtemp(`${temporaryRoot}/kommune-rss-`);
+  let remainingPdfScans = Number(process.env.MAX_PDF_SCANS || 80);
+  try {
+    for (const item of cases) {
+      const previousDocuments = new Map(
+        (previousCases[item.key]?.documents || []).map((document) => [document.key, document])
+      );
+      for (const document of item.documents) {
+        const previous = previousDocuments.get(document.key);
+        if (previous?.scanned) {
+          document.scanned = true;
+          document.matches = previous.matches || [];
+          continue;
+        }
+        const directMatches = municipalityMatches(`${item.title} ${document.title}`);
+        if (directMatches.length || initialCountyRun || remainingPdfScans <= 0) {
+          // På første kjøring registreres gamle dokumenter som utgangspunkt.
+          // Fulltekstlesing brukes på dokumenter som kommer til etterpå.
+          document.scanned = directMatches.length > 0 || initialCountyRun;
+          document.matches = directMatches;
+          continue;
+        }
+        remainingPdfScans -= 1;
+        try {
+          document.matches = municipalityMatches(await extractPdfText(document, directory));
+          document.scanned = true;
+        } catch (error) {
+          console.warn(`Kunne ikke lese ${document.title}: ${error.message}`);
+          document.matches = [];
+          document.attempts = (previous?.attempts || 0) + 1;
+          document.scanned = document.attempts >= 3;
+        }
+      }
+      item.municipalities = [
+        ...new Set([
+          ...municipalityMatches(item.title),
+          ...item.documents.flatMap((document) => document.matches || []),
+        ]),
+      ];
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  return cases;
+}
+
 async function buildSkaunPostlist() {
   const source = `${SKAUN_BASE}/${SKAUN_TENANT}/`;
   const data = await fetchJson(
@@ -204,7 +367,7 @@ async function buildSkaunPostlist() {
   };
 }
 
-function extractMeetingLinks(html, source, slug) {
+function extractMeetingLinks(html, source, slug, limit = 15) {
   const pattern = new RegExp(
     `href=["']([^"']*/Meetings/${slug}/Meetings/Details/\\d+)["']`,
     "gi"
@@ -215,7 +378,7 @@ function extractMeetingLinks(html, source, slug) {
         new URL(decodeHtml(match[1]), source).href
       )
     ),
-  ].slice(0, 15);
+  ].slice(0, limit);
 }
 
 function extractOpenGovMeeting(html, meetingUrl, slug, municipality) {
@@ -454,6 +617,67 @@ function buildMeetingEvents(sources, previousState) {
   };
 }
 
+function buildCountyEvents(cases, previousState, meetingState) {
+  const now = new Date().toUTCString();
+  const previousCases = previousState?.countyCases || {};
+  const nextCases = { ...previousCases };
+  const newEvents = [];
+
+  for (const item of cases) {
+    const previous = previousCases[item.key];
+    nextCases[item.key] = item;
+    if (!previousState?.countyMonitored || !item.municipalities.length) continue;
+
+    const previousMunicipalities = previous?.municipalities || [];
+    const municipalityLabel = item.municipalities.join(", ");
+    if (!previous || !previousMunicipalities.length) {
+      newEvents.push({
+        title: `[${municipalityLabel}] Ny fylkessak: ${item.title}`,
+        link: item.link,
+        guid: `ny-fylkessak-${item.key}`,
+        date: now,
+        description: `${item.meetingTitle}. Treff på: ${municipalityLabel}.`,
+      });
+      continue;
+    }
+
+    const previousKeys = new Set((previous.documents || []).map((document) => document.key));
+    const addedDocuments = item.documents.filter((document) => !previousKeys.has(document.key));
+    if (addedDocuments.length) {
+      newEvents.push({
+        title: `[${municipalityLabel}] Nye dokumenter: ${item.title}`,
+        link: item.link,
+        guid: revisionGuid(
+          "nye-fylkesdokumenter",
+          item.key,
+          item.documents.map((document) => document.key)
+        ),
+        date: now,
+        description: `${item.meetingTitle}. Nye dokumenter: ${shortDocumentList(
+          addedDocuments.map((document) => document.title),
+          4
+        )}`,
+      });
+    }
+  }
+
+  const countyEvents = uniqueBy(
+    [...newEvents, ...(previousState?.countyEvents || [])],
+    "guid"
+  ).slice(0, 100);
+  return {
+    state: {
+      ...meetingState,
+      version: 3,
+      countyMonitored: true,
+      countyCases: nextCases,
+      countyEvents,
+    },
+    events: countyEvents,
+    newEventCount: newEvents.length,
+  };
+}
+
 await mkdir("public", { recursive: true });
 
 const controlSources = CONTROL_COMMITTEES.map((committee) =>
@@ -462,17 +686,18 @@ const controlSources = CONTROL_COMMITTEES.map((committee) =>
     : buildOpenGovMeetings(committee)
 );
 
-const [previousState, skaunPostlist, skaunMeetings, openGovMeetings, controlMeetings] = await Promise.all([
-  loadPreviousState(),
+const previousState = await loadPreviousState();
+const [skaunPostlist, skaunMeetings, openGovMeetings, controlMeetings, countyCases] = await Promise.all([
   buildSkaunPostlist(),
   buildSkaunMeetings(),
   Promise.all(OPEN_GOV.map(buildOpenGovMeetings)),
   Promise.all(controlSources),
+  buildCountyCases(previousState),
 ]);
 
 await writeFeed("skaun-postliste.xml", skaunPostlist);
 const meetingSources = [skaunMeetings, ...openGovMeetings, ...controlMeetings];
-const { state, events, newEventCount } = buildMeetingEvents(
+const { state: meetingState, events, newEventCount } = buildMeetingEvents(
   meetingSources,
   previousState
 );
@@ -531,7 +756,20 @@ await writeFeed("alle-sakspapirer.xml", {
   })),
 });
 
-await writeFile("public/state.json", JSON.stringify(state, null, 2), "utf8");
+const countyResult = buildCountyEvents(countyCases, previousState, meetingState);
+console.log(
+  previousState?.countyMonitored
+    ? `${countyResult.newEventCount} nye relevante fylkessaker/-dokumenter`
+    : "Første fylkeskjøring: lagret utgangspunkt uten å varsle om gamle saker"
+);
+await writeFeed("trondelag-kommunesaker.xml", {
+  title: "Fylkessaker som gjelder Orkland, Skaun, Heim eller Rindal",
+  link: TRONDELAG_BASE,
+  description: "Nye fylkessaker og dokumenter som omtaler en av de fire kommunene",
+  items: countyResult.events,
+});
+
+await writeFile("public/state.json", JSON.stringify(countyResult.state, null, 2), "utf8");
 
 await writeFile(
   "public/index.html",
@@ -548,6 +786,7 @@ await writeFile(
   <li><a href="orkland-kontrollutvalg.xml">Kontrollutvalget Orkland</a></li>
   <li><a href="alle-kontrollutvalg.xml">Alle kontrollutvalg samlet</a></li>
   <li><a href="alle-sakspapirer.xml">Alle sakspapirer samlet</a></li>
+  <li><a href="trondelag-kommunesaker.xml">Relevante saker i Trøndelag fylkeskommune</a></li>
   </ul></html>`,
   "utf8"
 );
