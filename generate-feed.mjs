@@ -1,115 +1,297 @@
-import { chromium } from "playwright";
 import { mkdir, writeFile } from "node:fs/promises";
 
-const SOURCE_URL =
-  "https://prod01.elementscloud.no/publikum/939865942_PROD-939865942-SKAUN/";
+const SKAUN_TENANT = "939865942_PROD-939865942-SKAUN";
+const SKAUN_BASE = "https://prod01.elementscloud.no/publikum";
+
+const OPEN_GOV = [
+  { slug: "rindal", name: "Rindal" },
+  { slug: "heim", name: "Heim" },
+  { slug: "orkland", name: "Orkland" },
+];
+
+const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
 
 const escapeXml = (value = "") =>
-  value
+  String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
 
-const normalize = (value = "") => value.replace(/\s+/g, " ").trim();
+const decodeHtml = (value = "") =>
+  value
+    .replace(/&#(\d+);/g, (_, number) => String.fromCodePoint(Number(number)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, number) =>
+      String.fromCodePoint(Number.parseInt(number, 16))
+    )
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
 
-function parseNorwegianDate(text) {
-  const match = text.match(/Journaldato\s*(\d{2})\.(\d{2})\.(\d{4})/i);
-  if (!match) return null;
-  const [, day, month, year] = match;
-  return new Date(`${year}-${month}-${day}T12:00:00+02:00`).toUTCString();
+async function fetchChecked(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(60_000),
+    headers: {
+      Accept: "text/html,application/json",
+      "User-Agent": "skaun-rss/2.0 (+public RSS generator)",
+      ...options.headers,
+    },
+  });
+  if (!response.ok) throw new Error(`${response.status} fra ${url}`);
+  return response;
 }
 
-const browser = await chromium.launch({ headless: true });
+async function fetchText(url, options) {
+  return (await fetchChecked(url, options)).text();
+}
 
-try {
-  const page = await browser.newPage({
-    locale: "nb-NO",
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
-  });
-  page.setDefaultTimeout(10_000);
+async function fetchJson(url, options) {
+  return (await fetchChecked(url, options)).json();
+}
 
-  await page.goto(SOURCE_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: 90_000,
-  });
-
-  await page.waitForFunction(
-    () => document.querySelectorAll(".insn-list .card").length > 0,
-    { timeout: 90_000 }
+async function mapLimit(values, limit, worker) {
+  const output = new Array(values.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, values.length) }, async () => {
+      while (next < values.length) {
+        const index = next++;
+        output[index] = await worker(values[index], index);
+      }
+    })
   );
+  return output;
+}
 
-  // Les alle kort i én nettleseroperasjon. Dette unngår at en manglende
-  // selektor kan gi 30 sekunders venting for hvert enkelt kort.
-  const rawPosts = await page.locator(".insn-list .card").evaluateAll(
-    (cards, sourceUrl) =>
-      cards.slice(0, 50).map((card, index) => {
-        const titleNode =
-          card.querySelector(".card-title span.expanded-view-title") ||
-          card.querySelector(".card-title span.font-weight-bold") ||
-          card.querySelector(".card-title button");
-        const linkNode = card.querySelector(
-          '.card-title a[href*="/RegistryEntry/"]'
-        );
-        const title = (titleNode?.textContent || "").replace(/\s+/g, " ").trim();
-        const rawHref = linkNode?.getAttribute("href");
-        const link = rawHref ? new URL(rawHref, sourceUrl).href : sourceUrl;
-        const fullText = (card.textContent || "").replace(/\s+/g, " ").trim();
-        return { title, link, fullText, index };
-      }),
-    SOURCE_URL
-  );
+function uniqueBy(items, key) {
+  return [...new Map(items.map((item) => [item[key], item])).values()];
+}
 
-  const posts = rawPosts
-    .filter((post) => post.title)
-    .map((post) => ({
-      title: post.title,
-      link: post.link,
-      description: post.fullText,
-      published: parseNorwegianDate(post.fullText),
-      guid: `${post.link}#rss-${post.index}`,
-    }));
+function toRfc822(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? null : date.toUTCString();
+}
 
-  if (posts.length === 0) {
-    throw new Error("Fant ingen poster på Skaun-postlisten.");
-  }
-
-  const items = posts
+function rssXml({ title, link, description, items }) {
+  const body = items
+    .slice(0, 100)
     .map(
-      (post) => `    <item>
-      <title>${escapeXml(post.title)}</title>
-      <link>${escapeXml(post.link)}</link>
-      <guid isPermaLink="false">${escapeXml(post.guid)}</guid>
-      ${post.published ? `<pubDate>${post.published}</pubDate>` : ""}
-      <description>${escapeXml(post.description)}</description>
+      (item) => `    <item>
+      <title>${escapeXml(item.title)}</title>
+      <link>${escapeXml(item.link)}</link>
+      <guid isPermaLink="false">${escapeXml(item.guid)}</guid>
+      ${item.date ? `<pubDate>${escapeXml(item.date)}</pubDate>` : ""}
+      <description>${escapeXml(item.description || "")}</description>
     </item>`
     )
     .join("\n");
 
-  const rss = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>Postliste Skaun</title>
-    <link>${escapeXml(SOURCE_URL)}</link>
-    <description>Offentlig postliste for Skaun kommune</description>
+    <title>${escapeXml(title)}</title>
+    <link>${escapeXml(link)}</link>
+    <description>${escapeXml(description)}</description>
     <language>nb-no</language>
     <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
-${items}
+${body}
   </channel>
 </rss>
 `;
-
-  await mkdir("public", { recursive: true });
-  await writeFile("public/rss.xml", rss, "utf8");
-  await writeFile(
-    "public/index.html",
-    '<!doctype html><html lang="nb"><meta charset="utf-8"><title>Postliste Skaun RSS</title><h1>Postliste Skaun</h1><p><a href="rss.xml">Åpne RSS-feeden</a></p></html>',
-    "utf8"
-  );
-
-  console.log(`Skrev ${posts.length} poster til public/rss.xml`);
-} finally {
-  await browser.close();
 }
+
+async function writeFeed(filename, options) {
+  if (!options.items.length) throw new Error(`Ingen poster funnet for ${filename}`);
+  await writeFile(`public/${filename}`, rssXml(options), "utf8");
+  console.log(`${filename}: ${options.items.length} poster`);
+}
+
+async function buildSkaunPostlist() {
+  const source = `${SKAUN_BASE}/${SKAUN_TENANT}/`;
+  const data = await fetchJson(
+    `${SKAUN_BASE}/api/PredefinedQuery/CasesAndRegistryEntries`,
+    { headers: { Tenant: SKAUN_TENANT } }
+  );
+  const rows = Array.isArray(data) ? data : data.Items || [];
+  const items = rows.slice(0, 100).map((row) => ({
+    title: normalize(row.JP_INNHOLD_G) || `Journalpost ${row.JP_ID}`,
+    link: `${SKAUN_BASE}/${SKAUN_TENANT}/RegistryEntry/${row.JP_ID}`,
+    guid: `skaun-journalpost-${row.JP_ID}`,
+    date: toRfc822(row.JP_JDATO),
+    description: normalize(
+      [row.ND_BETEGN, row.SA_SAKSNR_XX && `sak ${row.SA_SAKSNR_XX}`]
+        .filter(Boolean)
+        .join(" – ")
+    ),
+  }));
+  return {
+    title: "Postliste Skaun",
+    link: source,
+    description: "Nye journalposter fra Skaun kommune",
+    items,
+  };
+}
+
+function extractMeetingLinks(html, source, slug) {
+  const pattern = new RegExp(
+    `href=["']([^"']*/Meetings/${slug}/Meetings/Details/\\d+)["']`,
+    "gi"
+  );
+  return [
+    ...new Set(
+      [...html.matchAll(pattern)].map((match) =>
+        new URL(decodeHtml(match[1]), source).href
+      )
+    ),
+  ].slice(0, 15);
+}
+
+function extractOpenGovDocuments(html, meetingUrl, municipality) {
+  const titleMatch = html.match(
+    /class=["'][^"']*meetingTitleHeaderText[^"']*["'][^>]*>([\s\S]*?)<\/h2>/i
+  );
+  const meetingTitle = normalize(
+    decodeHtml((titleMatch?.[1] || municipality).replace(/<[^>]+>/g, " "))
+  );
+  const hrefPattern = /href=["']([^"']*\/File\/Details\/[^"']+)["']/gi;
+  const documents = [];
+
+  for (const match of html.matchAll(hrefPattern)) {
+    const link = new URL(decodeHtml(match[1]), meetingUrl);
+    const fallback = decodeURIComponent(link.pathname.split("/").pop() || "Dokument");
+    const documentTitle = normalize(link.searchParams.get("fileName") || fallback);
+    documents.push({
+      title: documentTitle,
+      link: link.href,
+      guid: `${municipality.toLowerCase()}-${link.pathname}-${link.searchParams.get("fileSize") || ""}`,
+      description: meetingTitle,
+      date: null,
+    });
+  }
+  return documents;
+}
+
+async function buildOpenGovPapers({ slug, name }) {
+  const source = `https://opengov.360online.com/Meetings/${slug}`;
+  const indexHtml = await fetchText(source);
+  const meetingLinks = extractMeetingLinks(indexHtml, source, slug);
+  const pages = await mapLimit(meetingLinks, 4, async (url) => ({
+    url,
+    html: await fetchText(url),
+  }));
+  const items = uniqueBy(
+    pages.flatMap(({ url, html }) => extractOpenGovDocuments(html, url, name)),
+    "guid"
+  );
+  return {
+    title: `Nye sakspapirer ${name}`,
+    link: source,
+    description: `Nye møteinnkallinger, sakspapirer og protokoller fra ${name}`,
+    items,
+  };
+}
+
+async function buildSkaunPapers() {
+  const headers = { Tenant: SKAUN_TENANT };
+  const now = new Date();
+  const years = [now.getUTCFullYear() - 1, now.getUTCFullYear(), now.getUTCFullYear() + 1];
+  const meetingLists = await Promise.all(
+    years.map((year) =>
+      fetchJson(`${SKAUN_BASE}/api/PredefinedQuery/DmbMeetings?year=${year}&dmbName=`, {
+        headers,
+      })
+    )
+  );
+  const allMeetings = uniqueBy(meetingLists.flat(), "MO_ID");
+  const lower = now.valueOf() - 60 * 24 * 60 * 60 * 1000;
+  const upper = now.valueOf() + 400 * 24 * 60 * 60 * 1000;
+  const meetings = allMeetings
+    .filter((meeting) => {
+      const date = new Date(meeting.MO_START).valueOf();
+      return date >= lower && date <= upper;
+    })
+    .sort((a, b) => new Date(b.MO_START) - new Date(a.MO_START))
+    .slice(0, 40);
+
+  const results = await mapLimit(meetings, 5, async (meeting) => {
+    const [details, handlings] = await Promise.all([
+      fetchJson(`${SKAUN_BASE}/api/Meetings/${meeting.MO_ID}`, { headers }),
+      fetchJson(`${SKAUN_BASE}/api/DmbHandlings/GetByMeetingId/${meeting.MO_ID}`, {
+        headers,
+      }),
+    ]);
+    const meetingLink = `${SKAUN_BASE}/${SKAUN_TENANT}/DmbMeeting/${meeting.MO_ID}`;
+    const meetingDate = new Date(meeting.MO_START).toLocaleDateString("nb-NO", {
+      timeZone: "Europe/Oslo",
+    });
+    const context = `${meeting.UT_NAVN} ${meetingDate}`;
+    const meetingDocs = (details.MeetingDocuments || []).map((document) => ({
+      title: normalize(document.Title) || "Møtedokument",
+      link: meetingLink,
+      guid: `skaun-moetedokument-${document.Id}`,
+      description: context,
+      date: toRfc822(meeting.MO_START),
+    }));
+    const agendaItems = (handlings || []).map((handling) => ({
+      title: normalize(handling.Title) || `Sak ${handling.Id}`,
+      link: meetingLink,
+      guid: `skaun-moetesak-${handling.Id}`,
+      description: context,
+      date: toRfc822(meeting.MO_START),
+    }));
+    return [...meetingDocs, ...agendaItems];
+  });
+
+  return {
+    title: "Nye sakspapirer Skaun",
+    link: `${SKAUN_BASE}/${SKAUN_TENANT}/Dmb`,
+    description: "Nye møtedokumenter og saker fra Skaun kommune",
+    items: uniqueBy(results.flat(), "guid"),
+  };
+}
+
+await mkdir("public", { recursive: true });
+
+const [skaunPostlist, skaunPapers, ...openGovPapers] = await Promise.all([
+  buildSkaunPostlist(),
+  buildSkaunPapers(),
+  ...OPEN_GOV.map(buildOpenGovPapers),
+]);
+
+await writeFeed("skaun-postliste.xml", skaunPostlist);
+await writeFeed("skaun-sakspapirer.xml", skaunPapers);
+
+for (let index = 0; index < OPEN_GOV.length; index += 1) {
+  await writeFeed(`${OPEN_GOV[index].slug}-sakspapirer.xml`, openGovPapers[index]);
+}
+
+const allPapers = [skaunPapers, ...openGovPapers];
+await writeFeed("alle-sakspapirer.xml", {
+  title: "Nye sakspapirer – alle kommuner",
+  link: skaunPapers.link,
+  description: "Nye politiske sakspapirer fra Skaun, Rindal, Heim og Orkland",
+  items: allPapers.flatMap((feed) =>
+    feed.items.map((item) => ({
+      ...item,
+      title: `[${feed.title.split(" ").at(-1)}] ${item.title}`,
+    }))
+  ),
+});
+
+await writeFile(
+  "public/index.html",
+  `<!doctype html><html lang="nb"><meta charset="utf-8"><title>Kommunale RSS-feeder</title>
+  <h1>Kommunale RSS-feeder</h1><ul>
+  <li><a href="skaun-postliste.xml">Postliste Skaun</a></li>
+  <li><a href="skaun-sakspapirer.xml">Sakspapirer Skaun</a></li>
+  <li><a href="rindal-sakspapirer.xml">Sakspapirer Rindal</a></li>
+  <li><a href="heim-sakspapirer.xml">Sakspapirer Heim</a></li>
+  <li><a href="orkland-sakspapirer.xml">Sakspapirer Orkland</a></li>
+  <li><a href="alle-sakspapirer.xml">Alle sakspapirer samlet</a></li>
+  </ul></html>`,
+  "utf8"
+);

@@ -6,7 +6,5 @@
   "scripts": {
     "generate": "node generate-feed.mjs"
   },
-  "dependencies": {
-    "playwright": "^1.55.0"
-  }
+  "dependencies": {}
 }
