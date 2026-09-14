@@ -1,0 +1,54 @@
+name: Oppdater RSS-feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Hent kode
+        uses: actions/checkout@v4
+
+      - name: Sett opp Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installer pakker
+        run: npm install
+
+      - name: Installer Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Lag RSS-filen
+        run: npm run generate
+
+      - name: Sett opp GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Last opp nettsiden
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Publiser nettsiden
+        id: deployment
+        uses: actions/deploy-pages@v4
