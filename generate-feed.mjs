@@ -539,6 +539,10 @@ function eventDescription(prefix, papers) {
   return `${prefix}: ${shortDocumentList(papers.map((paper) => paper.title))}`;
 }
 
+function isProtocolDocument(paper) {
+  return /(protokoll|møtebok)/i.test(normalize(paper?.title || ""));
+}
+
 function buildMeetingEvents(sources, previousState) {
   const now = new Date().toUTCString();
   const previousMeetings = previousState?.meetings || {};
@@ -555,42 +559,42 @@ function buildMeetingEvents(sources, previousState) {
   for (const meeting of currentMeetings) {
     const previous = previousMeetings[meeting.key];
     const sourceKey = meeting.key.split(":")[0];
-    const currentPaperKeys = meeting.papers.map((paper) => paper.key);
+    const currentPapers = (meeting.papers || []).filter(
+      (paper) => !isProtocolDocument(paper)
+    );
     nextMeetings[meeting.key] = {
       municipality: meeting.municipality,
       title: meeting.title,
       link: meeting.link,
-      papers: meeting.papers,
+      papers: currentPapers,
     };
 
     // Første kjøring oppretter bare et utgangspunkt og sender ingen gamle varsler.
     if (!previousState || !monitoredSources.has(sourceKey)) continue;
 
     if (!previous) {
+      if (!currentPapers.length) continue;
       newEvents.push({
         municipality: meeting.municipality,
-        title: `Nytt møte: ${meeting.title}`,
+        title: `Nye sakspapirer: ${meeting.title}`,
         link: meeting.link,
-        guid: `nytt-mote-${meeting.key}`,
-        description: eventDescription("Saker/dokumenter", meeting.papers),
+        guid: `forste-sakspapirer-${meeting.key}`,
+        description: eventDescription("Saker/dokumenter", currentPapers),
         date: now,
       });
       continue;
     }
 
-    const previousKeys = new Set((previous.papers || []).map((paper) => paper.key));
-    const addedPapers = meeting.papers.filter((paper) => !previousKeys.has(paper.key));
-    if (addedPapers.length) {
+    const previousPapers = (previous.papers || []).filter(
+      (paper) => !isProtocolDocument(paper)
+    );
+    if (!previousPapers.length && currentPapers.length) {
       newEvents.push({
         municipality: meeting.municipality,
         title: `Nye sakspapirer: ${meeting.title}`,
         link: meeting.link,
-        guid: revisionGuid(
-          "nye-sakspapirer",
-          meeting.key,
-          currentPaperKeys
-        ),
-        description: eventDescription("Nye saker/dokumenter", addedPapers),
+        guid: `forste-sakspapirer-${meeting.key}`,
+        description: eventDescription("Saker/dokumenter", currentPapers),
         date: now,
       });
     }
